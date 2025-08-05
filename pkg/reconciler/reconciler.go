@@ -54,46 +54,72 @@ var (
 func (r *Reconciler) ReconcileKind(ctx context.Context, pr *tektonv1.PipelineRun) pkgreconciler.Event {
 	ctx = info.StoreNS(ctx, system.Namespace())
 	logger := logging.FromContext(ctx).With("namespace", pr.GetNamespace())
+
+	logger.Infof("=== RECONCILE START: PipelineRun %s/%s (resourceVersion: %s) ===", pr.GetNamespace(), pr.GetName(), pr.GetResourceVersion())
+
 	// if pipelineRun is in completed or failed state then return
 	state, exist := pr.GetAnnotations()[keys.State]
+	logger.Infof("RECONCILE: PipelineRun %s/%s - state='%s' (exists: %v), spec.status='%s'", pr.GetNamespace(), pr.GetName(), state, exist, pr.Spec.Status)
+
 	if exist && (state == kubeinteraction.StateCompleted || state == kubeinteraction.StateFailed) {
+		logger.Infof("=== RECONCILE END: PipelineRun %s/%s - PATH: EARLY EXIT (final state) ===", pr.GetNamespace(), pr.GetName())
 		return nil
 	}
 
 	reason := ""
 	if len(pr.Status.GetConditions()) > 0 {
 		reason = pr.Status.GetConditions()[0].GetReason()
+		logger.Infof("RECONCILE: PipelineRun %s/%s current reason: '%s'", pr.GetNamespace(), pr.GetName(), reason)
+	} else {
+		logger.Infof("RECONCILE: PipelineRun %s/%s has no status conditions yet", pr.GetNamespace(), pr.GetName())
 	}
+
 	// This condition handles cases where the PipelineRun has entered a "Running" state,
 	// but its status in the Git provider remains "queued" (e.g., due to updates made by
 	// another controller outside PaC). To maintain consistency between the PipelineRun
 	// status and the Git provider status, we update both the PipelineRun resource and
 	// the corresponding status on the Git provider here.
+	logger.Infof("RECONCILE: Checking condition - reason='%s' (is Running: %v), state='%s' (is queued: %v)",
+		reason, reason == string(tektonv1.PipelineRunReasonRunning), state, state == kubeinteraction.StateQueued)
+
 	if reason == string(tektonv1.PipelineRunReasonRunning) && state == kubeinteraction.StateQueued {
+		logger.Infof("RECONCILE: PATH 1 - PipelineRun %s/%s condition met (reason=Running, state=queued), calling updatePipelineRunToInProgress", pr.GetNamespace(), pr.GetName())
 		repoName := pr.GetAnnotations()[keys.Repository]
 		repo, err := r.repoLister.Repositories(pr.Namespace).Get(repoName)
 		if err != nil {
 			return fmt.Errorf("failed to get repository CR: %w", err)
 		}
+		logger.Infof("=== RECONCILE END: PipelineRun %s/%s - PATH: DIRECT CONDITION ===", pr.GetNamespace(), pr.GetName())
 		return r.updatePipelineRunToInProgress(ctx, logger, repo, pr)
+	} else {
+		logger.Infof("RECONCILE: Condition NOT met for %s/%s - reason='%s', state='%s'", pr.GetNamespace(), pr.GetName(), reason, state)
 	}
 
 	// if its a GitHub App pipelineRun PR then process only if check run id is added otherwise wait
 	if _, ok := pr.Annotations[keys.InstallationID]; ok {
+		logger.Infof("RECONCILE: PipelineRun %s/%s is a GitHub App PipelineRun, checking for CheckRunID", pr.GetNamespace(), pr.GetName())
 		if _, ok := pr.Annotations[keys.CheckRunID]; !ok {
+			logger.Infof("=== RECONCILE END: PipelineRun %s/%s - PATH: EARLY EXIT (waiting for CheckRunID) ===", pr.GetNamespace(), pr.GetName())
 			return nil
 		}
+		logger.Infof("RECONCILE: PipelineRun %s/%s has CheckRunID, proceeding", pr.GetNamespace(), pr.GetName())
 	}
 
 	// queue pipelines which are in queued state and pending status
 	// if status is not pending, it could be canceled so let it be reported, even if state is queued
 	if state == kubeinteraction.StateQueued && pr.Spec.Status == tektonv1.PipelineRunSpecStatusPending {
+		logger.Infof("RECONCILE: PATH 2 - PipelineRun %s/%s is queued with pending status, calling queuePipelineRun", pr.GetNamespace(), pr.GetName())
+		logger.Infof("=== RECONCILE END: PipelineRun %s/%s - PATH: QUEUE PROCESSING ===", pr.GetNamespace(), pr.GetName())
 		return r.queuePipelineRun(ctx, logger, pr)
 	}
 
 	if !pr.IsDone() && !pr.IsCancelled() {
+		logger.Infof("RECONCILE: PipelineRun %s/%s is not done and not cancelled, skipping final status", pr.GetNamespace(), pr.GetName())
+		logger.Infof("=== RECONCILE END: PipelineRun %s/%s - PATH: EARLY EXIT (not done) ===", pr.GetNamespace(), pr.GetName())
 		return nil
 	}
+
+	logger.Infof("RECONCILE: PATH 3 - PipelineRun %s/%s is done, processing final status", pr.GetNamespace(), pr.GetName())
 
 	// make sure we have the latest pipelinerun to reconcile, since there is something updating at the same time
 	lpr, err := r.run.Clients.Tekton.TektonV1().PipelineRuns(pr.GetNamespace()).Get(ctx, pr.GetName(), metav1.GetOptions{})
@@ -267,10 +293,26 @@ func (r *Reconciler) reportFinalStatus(ctx context.Context, logger *zap.SugaredL
 }
 
 func (r *Reconciler) updatePipelineRunToInProgress(ctx context.Context, logger *zap.SugaredLogger, repo *v1alpha1.Repository, pr *tektonv1.PipelineRun) error {
+	logger.Infof("*** updatePipelineRunToInProgress CALLED for PipelineRun %s/%s (resourceVersion: %s) ***", pr.GetNamespace(), pr.GetName(), pr.GetResourceVersion())
+
+	// Guard: Check if already in "started" state to prevent duplicate processing
+	currentState := pr.GetAnnotations()[keys.State]
+	logger.Infof("*** Current state before update: %s ***", currentState)
+
+	if currentState == kubeinteraction.StateStarted {
+		logger.Infof("*** PipelineRun %s/%s already in 'started' state, skipping duplicate SCM reporting ***", pr.GetNamespace(), pr.GetName())
+		return nil
+	}
+
+	logger.Infof("updating pipelineRun %v/%v state to %v and reporting status to provider", pr.GetNamespace(), pr.GetName(), kubeinteraction.StateStarted)
+
 	pr, err := r.updatePipelineRunState(ctx, logger, pr, kubeinteraction.StateStarted)
 	if err != nil {
+		logger.Errorf("Failed to update PipelineRun %s/%s state to %s: %v", pr.GetNamespace(), pr.GetName(), kubeinteraction.StateStarted, err)
 		return fmt.Errorf("cannot update state: %w", err)
 	}
+	logger.Infof("*** Successfully updated PipelineRun %s/%s state to %s (new resourceVersion: %s) ***", pr.GetNamespace(), pr.GetName(), kubeinteraction.StateStarted, pr.GetResourceVersion())
+
 	pacInfo := r.run.Info.GetPacOpts()
 	detectedProvider, event, err := r.detectProvider(ctx, logger, pr)
 	if err != nil {
@@ -334,15 +376,23 @@ func (r *Reconciler) updatePipelineRunToInProgress(ctx context.Context, logger *
 	if err := createStatusWithRetry(ctx, logger, detectedProvider, event, status); err != nil {
 		// if failed to report status for running state, let the pipelineRun continue,
 		// pipelineRun is already started so we will try again once it completes
-		logger.Errorf("failed to report status to running on provider continuing! error: %v", err)
+		logger.Errorf("*** FAILED to report status to SCM for PipelineRun %s/%s: %v ***", pr.GetNamespace(), pr.GetName(), err)
 		return nil
 	}
 
-	logger.Info("updated in_progress status on provider platform for pipelineRun ", pr.GetName())
+	logger.Infof("*** SUCCESS: Reported 'in_progress' status to SCM for PipelineRun %s/%s ***", pr.GetNamespace(), pr.GetName())
 	return nil
 }
 
 func (r *Reconciler) updatePipelineRunState(ctx context.Context, logger *zap.SugaredLogger, pr *tektonv1.PipelineRun, state string) (*tektonv1.PipelineRun, error) {
+	// Guard against unnecessary state transitions
+	currentState := pr.GetAnnotations()[keys.State]
+	if currentState == state {
+		logger.Infof("PipelineRun %s/%s already in state %s, skipping update", pr.GetNamespace(), pr.GetName(), state)
+		return pr, nil
+	}
+
+	logger.Infof("updating pipelineRun %v/%v state from %s to %s", pr.GetNamespace(), pr.GetName(), currentState, state)
 	mergePatch := map[string]any{
 		"metadata": map[string]any{
 			"labels": map[string]string{
