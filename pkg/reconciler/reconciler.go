@@ -57,6 +57,20 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, pr *tektonv1.PipelineRun
 
 	logger.Infof("=== RECONCILE START: PipelineRun %s/%s (resourceVersion: %s) ===", pr.GetNamespace(), pr.GetName(), pr.GetResourceVersion())
 
+	// Get fresh PipelineRun from API server to avoid informer cache staleness
+	freshPR, err := r.run.Clients.Tekton.TektonV1().PipelineRuns(pr.GetNamespace()).Get(ctx, pr.GetName(), metav1.GetOptions{})
+	if err != nil {
+		logger.Errorf("Failed to get fresh PipelineRun %s/%s: %v", pr.GetNamespace(), pr.GetName(), err)
+		return fmt.Errorf("cannot get fresh PipelineRun: %w", err)
+	}
+
+	if freshPR.GetResourceVersion() != pr.GetResourceVersion() {
+		logger.Infof("Using fresh PipelineRun data (cached version %s vs fresh version %s)", pr.GetResourceVersion(), freshPR.GetResourceVersion())
+		pr = freshPR
+	} else {
+		logger.Infof("Cached PipelineRun data is current (resourceVersion: %s)", pr.GetResourceVersion())
+	}
+
 	// if pipelineRun is in completed or failed state then return
 	state, exist := pr.GetAnnotations()[keys.State]
 	logger.Infof("RECONCILE: PipelineRun %s/%s - state='%s' (exists: %v), spec.status='%s'", pr.GetNamespace(), pr.GetName(), state, exist, pr.Spec.Status)
