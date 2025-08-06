@@ -93,10 +93,19 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, pr *tektonv1.PipelineRun
 	// another controller outside PaC). To maintain consistency between the PipelineRun
 	// status and the Git provider status, we update both the PipelineRun resource and
 	// the corresponding status on the Git provider here.
-	logger.Infof("RECONCILE: Checking condition - reason='%s' (is Running: %v), state='%s' (is queued: %v)",
-		reason, reason == string(tektonv1.PipelineRunReasonRunning), state, state == kubeinteraction.StateQueued)
 
-	if reason == string(tektonv1.PipelineRunReasonRunning) && state == kubeinteraction.StateQueued {
+	startReported := false
+	scmReportingPLRStarted, exist := pr.GetAnnotations()[keys.SCMReportingPLRStarted]
+	if exist && scmReportingPLRStarted == "true" {
+		startReported = true
+	} else if !exist {
+		logger.Infof("RECONCILE: PipelineRun %s/%s has no %s annotation", pr.GetNamespace(), pr.GetName(), keys.SCMReportingPLRStarted)
+	}
+
+	logger.Infof("RECONCILE: Checking condition - reason='%s' (is Running: %v), state='%s' (is queued: %v) (startReported: %v)",
+		reason, reason == string(tektonv1.PipelineRunReasonRunning), state, state == kubeinteraction.StateQueued, startReported)
+
+	if reason == string(tektonv1.PipelineRunReasonRunning) && !startReported {
 		logger.Infof("RECONCILE: PATH 1 - PipelineRun %s/%s condition met (reason=Running, state=queued), calling updatePipelineRunToInProgress", pr.GetNamespace(), pr.GetName())
 		repoName := pr.GetAnnotations()[keys.Repository]
 		repo, err := r.repoLister.Repositories(pr.Namespace).Get(repoName)
@@ -106,7 +115,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, pr *tektonv1.PipelineRun
 		logger.Infof("=== RECONCILE END: PipelineRun %s/%s - PATH: DIRECT CONDITION ===", pr.GetNamespace(), pr.GetName())
 		return r.updatePipelineRunToInProgress(ctx, logger, repo, pr)
 	} else {
-		logger.Infof("RECONCILE: Condition NOT met for %s/%s - reason='%s', state='%s'", pr.GetNamespace(), pr.GetName(), reason, state)
+		logger.Infof("RECONCILE: Condition NOT met for %s/%s - reason='%s', state='%s' (startReported: %v)", pr.GetNamespace(), pr.GetName(), reason, state, startReported)
 	}
 
 	// if its a GitHub App pipelineRun PR then process only if check run id is added otherwise wait
@@ -407,16 +416,22 @@ func (r *Reconciler) updatePipelineRunState(ctx context.Context, logger *zap.Sug
 	}
 
 	logger.Infof("updating pipelineRun %v/%v state from %s to %s", pr.GetNamespace(), pr.GetName(), currentState, state)
+	annotations := map[string]string{
+		keys.State: state,
+	}
+	if state == kubeinteraction.StateStarted {
+		annotations[keys.SCMReportingPLRStarted] = "true"
+	}
+
 	mergePatch := map[string]any{
 		"metadata": map[string]any{
 			"labels": map[string]string{
 				keys.State: state,
 			},
-			"annotations": map[string]string{
-				keys.State: state,
-			},
+			"annotations": annotations,
 		},
 	}
+
 	// if state is started then remove pipelineRun pending status
 	if state == kubeinteraction.StateStarted {
 		mergePatch["spec"] = map[string]any{

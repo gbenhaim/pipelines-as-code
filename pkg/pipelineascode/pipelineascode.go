@@ -257,6 +257,9 @@ func (p *PacRun) startPR(ctx context.Context, match matcher.Match) (*tektonv1.Pi
 		whatPatching = "annotations.state and labels.state"
 		patchAnnotations[keys.State] = kubeinteraction.StateQueued
 		patchLabels[keys.State] = kubeinteraction.StateQueued
+	} else {
+		patchAnnotations[keys.SCMReportingPLRStarted] = "true"
+		whatPatching = fmt.Sprintf("annotation.%s", keys.SCMReportingPLRStarted)
 	}
 
 	if err := p.vcx.CreateStatus(ctx, p.event, status); err != nil {
